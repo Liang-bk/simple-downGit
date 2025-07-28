@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 )
 
 type FileType int
@@ -135,4 +136,14 @@ func parseGithubURL(httpURL string) (*githubURLInfo, error) {
 		pathType: matches[3], // 'tree' or 'blob'
 		path:     matches[4],
 	}, nil
+}
+
+func getNameFromURL(httpURL string) string {
+	var name string = ""
+	splits := strings.Split(httpURL, "/")
+	// dirName or filename
+	if len(splits) > 0 {
+		name = splits[len(splits)-1]
+	}
+	return name
 }

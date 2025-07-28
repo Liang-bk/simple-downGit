@@ -5,12 +5,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 var (
@@ -61,10 +65,10 @@ func transformGithubURL(githubUrl string) (string, error) {
 
 func initSetting() {
 	// 进度条
-	// 代理
+	// TODO: 代理
 	// goroutine多协程请求
-	// github api配置
-	// 暂停/续传?
+	// TODO: github api配置
+	// TODO: 暂停/续传?
 }
 
 func main() {
@@ -81,8 +85,23 @@ func main() {
 		downloadDir(downloadUrl)
 	} else {
 		// 处理文件流程
-		downloadFile(downloadUrl, "")
+		p := mpb.New(mpb.WithWidth(64))
+		var wg sync.WaitGroup
+		wg.Add(1)
+		fileName := getNameFromURL(downloadUrl)
+		bar := p.New(-1, mpb.BarStyle().Lbound("[").Rbound("]"),
+			mpb.PrependDecorators(
+				decor.Name(fileName, decor.WC{W: len(fileName) + 1, C: decor.DindentRight}),
+				decor.CountersKibiByte("% .2f / % .2f"),
+			),
+			mpb.AppendDecorators(
+				decor.OnAbort(decor.Percentage(decor.WC{W: 6}), "error!"),
+				decor.OnComplete(decor.Percentage(decor.WC{W: 5}), "done!"),
+			))
+		go downloadFile(bar, &wg, downloadUrl, "")
+		p.Wait()
 	}
+	fmt.Println("all files download done!")
 }
 
 func savedPathExist(path string) bool {
@@ -97,57 +116,101 @@ func savedPathExist(path string) bool {
 // url is a dir -> mkdir url, then solve [url/dir1, url/dir2, ... url/file]
 // url is a file -> download it
 
-func downloadFile(fileURL, savedPath string) {
+func downloadFile(bar *mpb.Bar, wg *sync.WaitGroup, fileURL, savedPath string) {
+	defer wg.Done()
 	fileURL, err := transformGithubURL(fileURL)
 	if err != nil {
+		bar.Abort(false)
+		errLog := fmt.Sprintf("Error transforming URL: %v\n", err)
+		// 全局的log消息日志
+		log.Println(errLog)
 		return
 	}
+
 	resp, err := http.Get(fileURL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error making http request: %v\n", err)
-		return
-	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Error: receive bad status code %s\n", resp.Status)
+	if err != nil {
+		bar.Abort(false)
+		errLog := fmt.Sprintf("Error making http request for %s: %v\n", fileURL, err)
+		log.Println(errLog)
 		return
 	}
-	var filePath, fileName string = savedPath, ""
-	splits := strings.Split(fileURL, "/")
-	fileName = splits[len(splits)-1]
+
+	if resp.StatusCode != http.StatusOK {
+		bar.Abort(false)
+		errLog := fmt.Sprintf("Error downloading %s: bad status %s\n", fileURL, resp.Status)
+		log.Println(errLog)
+		return
+	}
+	// status is 200 ok
+	var filePath string = savedPath
+	var fileName string = getNameFromURL(fileURL)
 	if filePath == "" {
 		filePath = filepath.Join(output, fileName)
 	}
 	filePath = filepath.Join(output, filePath)
 	var dirPath = filePath[:len(filePath)-len(fileName)]
-	// 保存路径不存在, 先创建
+
 	if !savedPathExist(dirPath) {
 		err := os.MkdirAll(dirPath, os.ModePerm)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
+			bar.Abort(false)
+			errLog := fmt.Sprintf("Error creating output directory: %v\n", err)
+			log.Println(errLog)
 			return
 		}
 	}
+
 	file, err := os.Create(filePath)
+	defer file.Close()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating file: %v\n", err)
+		bar.Abort(false)
+		errLog := fmt.Sprintf("Error creating file %s: %v\n", filePath, err)
+		log.Println(errLog)
 		return
 	}
-	defer file.Close()
-	_, err = io.Copy(file, resp.Body)
+	// 计算大小
+	contentLen := resp.ContentLength
+	if contentLen <= 0 {
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			bar.Abort(false)
+			errLog := fmt.Sprintf("Error reading response body for %s: %v\n", fileName, err)
+			log.Println(errLog)
+			return
+		}
+		contentLen = int64(len(data))
+	}
+	bar.SetTotal(contentLen, false)
+	proxyReader := bar.ProxyReader(resp.Body)
+	defer proxyReader.Close()
+
+	_, err = io.Copy(file, proxyReader)
+
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing file: %v\n", err)
+		// Abort the bar so p.Wait() doesn't hang.
+		bar.Abort(false)
+		errLog := fmt.Sprintf("Error writing file %s: %v\n", fileName, err)
+		log.Println(errLog)
 		return
+	}
+	// 确保进度条完成
+	if !bar.Completed() {
+		bar.SetTotal(contentLen, true)
 	}
 }
 
 func downloadDir(dirURL string) {
-	var dirName string = ""
-	{
-		splits := strings.Split(downloadUrl, "/")
-		// dirName
-		dirName = splits[len(splits)-1]
-	}
+	var dirName string = getNameFromURL(downloadUrl)
+
+	var wg sync.WaitGroup
+	// Create a progress container with a WaitGroup
+	p := mpb.New(mpb.WithWaitGroup(&wg), mpb.WithWidth(60))
+
+	// Use a buffered channel to limit concurrency
+	maxConcurrency := 5
+	guard := make(chan struct{}, maxConcurrency)
+
 	// 进入这个文件夹, list所有文件夹/文件
 	// 保存github url, 相对路径dir_path
 	queue := list.New()
@@ -171,8 +234,30 @@ func downloadDir(dirURL string) {
 					queue.PushBack(elem)
 				}
 			} else {
-				downloadFile(entry.URL, entry.Name)
+				fileName := getNameFromURL(entry.URL)
+				bar := p.New(-1, mpb.BarStyle().Lbound("[").Rbound("]"),
+					mpb.PrependDecorators(
+						decor.Name(fileName, decor.WC{W: len(fileName) + 1, C: decor.DindentRight}),
+						decor.CountersKibiByte("% .2f / % .2f"),
+					),
+					mpb.AppendDecorators(
+						decor.OnAbort(decor.Percentage(decor.WC{W: 7}), " error"),
+						decor.OnComplete(decor.Percentage(decor.WC{W: 6}), " done!"),
+					),
+				)
+				// Acquire a slot from the guard channel
+				guard <- struct{}{}
+				wg.Add(1)
+				go func(entry GithubEntry) {
+					defer func() { <-guard }() // Release the slot
+					downloadFile(bar, &wg, entry.URL, entry.Name)
+				}(entry)
 			}
 		}
 	}
+
+	// wg.Wait() // not necessary
+	// Wait for all bars to complete
+	p.Wait()
+	fmt.Println("out of the queue")
 }
